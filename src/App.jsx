@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { supabase } from './lib/supabase'
+import {
+  checkPremiumToken,
+  getStoredPremiumToken,
+  storePremiumToken,
+  verifyPremiumSession,
+} from './lib/premium'
 import { advanceDueDate, daysUntil } from './lib/helpers'
 import Dashboard from './components/Dashboard'
 import Bills from './components/Bills'
@@ -19,8 +25,9 @@ function Landing({ onShowAuth }) {
   return (
     <div className="min-h-screen bg-white">
       <header className="mx-auto flex max-w-5xl items-center justify-between px-4 py-5">
-        <p className="text-xl font-extrabold">
-          <span className="text-emerald-600">●</span> BillBeacon
+        <p className="flex items-center gap-2">
+          <img src="/logo-mark.png" alt="BillBeacon logo" className="h-8 w-8 rounded-lg object-cover" />
+          <img src="/logo-wordmark.png" alt="BillBeacon" className="h-6 w-auto" />
         </p>
         <button className="btn-primary" onClick={onShowAuth}>
           Get started free
@@ -205,6 +212,9 @@ export default function App() {
   const [showAuth, setShowAuth] = useState(false)
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState('')
+  // Premium is decided ONLY by the Supabase backend (see src/lib/premium.js).
+  // profile.is_premium is no longer trusted — it was the free-unlock hole.
+  const [premiumVerified, setPremiumVerified] = useState(false)
 
   const loadAll = useCallback(async (userId) => {
     const [{ data: profileRows }, { data: billRows }, { data: paymentRows }] =
@@ -258,6 +268,47 @@ export default function App() {
     })
     return () => listener.subscription.unsubscribe()
   }, [loadAll])
+
+  // Verify Premium with the Supabase backend on every load.
+  // 1. If Stripe just sent the user back with ?session_id=, verify that
+  //    session with the server. On success the session id becomes the
+  //    stored token; session_id is then stripped from the URL so a
+  //    refresh does not re-verify.
+  // 2. Otherwise, if a token is stored, ask the server whether it is
+  //    still entitled. Premium is on ONLY while the server says so.
+  // A stored token is never trusted on its own, and any failure (missing
+  // env vars, network error, cancelled subscription) leaves Premium off.
+  useEffect(() => {
+    let cancelled = false
+    const resolvePremium = async () => {
+      const params = new URLSearchParams(window.location.search)
+      const sessionId = params.get('session_id')
+      if (sessionId) {
+        const verified = await verifyPremiumSession(sessionId)
+        if (!cancelled && verified) {
+          storePremiumToken(sessionId)
+          setPremiumVerified(true)
+        }
+        params.delete('session_id')
+        const qs = params.toString()
+        window.history.replaceState(
+          null,
+          '',
+          window.location.pathname + (qs ? `?${qs}` : '') + window.location.hash,
+        )
+        if (verified) return
+      }
+      const token = getStoredPremiumToken()
+      if (token) {
+        const stillPremium = await checkPremiumToken(token)
+        if (!cancelled) setPremiumVerified(stillPremium)
+      }
+    }
+    resolvePremium()
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   const refreshBills = useCallback(async () => {
     if (!user) return
@@ -379,11 +430,12 @@ export default function App() {
       <header className="sticky top-0 z-40 border-b border-slate-200 bg-white">
         <div className="mx-auto flex max-w-5xl items-center justify-between px-4 py-3">
           <button
-            className="text-lg font-extrabold"
+            className="flex items-center gap-2 text-lg font-extrabold"
             onClick={() => setView('dashboard')}
           >
-            <span className="text-emerald-600">●</span> BillBeacon
-            {profile?.is_premium && (
+            <img src="/logo-mark.png" alt="BillBeacon logo" className="h-8 w-8 rounded-lg object-cover" />
+            <img src="/logo-wordmark.png" alt="BillBeacon" className="h-6 w-auto" />
+            {premiumVerified && (
               <span className="ml-2 rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-bold text-emerald-700">
                 Premium
               </span>
@@ -427,7 +479,7 @@ export default function App() {
         {view === 'bills' && (
           <Bills
             bills={bills}
-            isPremium={!!profile?.is_premium}
+            isPremium={premiumVerified}
             onSave={saveBill}
             onDelete={deleteBill}
             onMarkPaid={markPaid}
@@ -448,6 +500,7 @@ export default function App() {
           <Settings
             user={user}
             profile={profile}
+            isPremium={premiumVerified}
             bills={bills}
             payments={payments}
             onUpdateProfile={updateProfile}
